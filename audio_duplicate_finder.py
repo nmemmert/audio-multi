@@ -393,22 +393,152 @@ def get_audio_metadata(file_path):
             'duration': 0,
         }
 
+def parse_filename_metadata(filename):
+    """Parse metadata information from filename using common patterns."""
+    # Remove file extension
+    name = os.path.splitext(filename)[0]
+    
+    # Common patterns for audio files
+    patterns = [
+        # Pattern: "Artist - Title"
+        r'^(.+?)\s*-\s*(.+)$',
+        # Pattern: "Artist_Title" (underscore)
+        r'^(.+?)_(.+)$',
+        # Pattern: "Track Number. Artist - Title"
+        r'^\d+\.?\s*(.+?)\s*-\s*(.+)$',
+        # Pattern: "Track Number - Artist - Title"
+        r'^\d+\s*-\s*(.+?)\s*-\s*(.+)$',
+        # Pattern: "Artist Title" (space separated, assume last word is title)
+        r'^(.+?)\s+([^\s]+)$',
+        # Pattern: "[Year] Artist - Title"
+        r'^\[\d{4}\]\s*(.+?)\s*-\s*(.+)$',
+        # Pattern: "(Album) Artist - Title"  
+        r'^\(.+?\)\s*(.+?)\s*-\s*(.+)$'
+    ]
+    
+    parsed = {'artist': '', 'title': '', 'album': ''}
+    
+    for pattern in patterns:
+        match = re.match(pattern, name, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            if len(groups) >= 2:
+                artist = groups[0].strip()
+                title = groups[1].strip()
+                
+                # Clean up common prefixes/suffixes
+                artist = re.sub(r'^(the\s+)', '', artist, flags=re.IGNORECASE)
+                title = re.sub(r'\s*\(.*?\)\s*$', '', title)  # Remove trailing parentheses
+                title = re.sub(r'\s*\[.*?\]\s*$', '', title)  # Remove trailing brackets
+                
+                parsed['artist'] = artist
+                parsed['title'] = title
+                break
+    
+    # If no pattern matched, use filename as title
+    if not parsed['title']:
+        # Clean filename for title
+        cleaned = re.sub(r'[\[\(].*?[\]\)]', '', name)  # Remove bracketed content
+        cleaned = re.sub(r'^\d+\.?\s*', '', cleaned)    # Remove leading numbers
+        cleaned = cleaned.strip()
+        parsed['title'] = cleaned if cleaned else name
+    
+    return parsed
+
+def enhance_metadata_with_filename(file_metadata):
+    """Enhance existing metadata using filename information.""" 
+    filename = os.path.basename(file_metadata['file_path'])
+    filename_data = parse_filename_metadata(filename)
+    
+    enhanced = file_metadata.copy()
+    
+    # Use filename data if current metadata is missing or generic
+    if not enhanced['artist'] or enhanced['artist'].lower() in ['unknown', '']:
+        enhanced['artist'] = filename_data['artist']
+        
+    if not enhanced['title'] or enhanced['title'].lower() in ['unknown', '']:
+        enhanced['title'] = filename_data['title']
+        
+    # Prefer filename data if it looks more complete
+    if (filename_data['artist'] and filename_data['title'] and 
+        len(filename_data['artist']) > 2 and len(filename_data['title']) > 2):
+        if not enhanced['artist'] or len(enhanced['artist']) < 3:
+            enhanced['artist'] = filename_data['artist']
+        if not enhanced['title'] or len(enhanced['title']) < 3:
+            enhanced['title'] = filename_data['title']
+    
+    return enhanced
+
 def search_musicbrainz(artist, title, album=""):
-    """Search MusicBrainz for track information."""
+    """Search MusicBrainz for track information with enhanced matching."""
     try:
-        if not artist or artist == 'Unknown' or not title or title == 'Unknown':
+        # Clean input data
+        if artist:
+            artist = artist.strip()
+        if title:
+            title = title.strip()
+        if album:
+            album = album.strip()
+            
+        if not artist or artist.lower() in ['unknown', ''] or not title or title.lower() in ['unknown', '']:
             return None
             
-        # Search for recordings
-        result = musicbrainzngs.search_recordings(
-            artist=artist, 
-            recording=title, 
-            release=album if album and album != 'Unknown' else "",
-            limit=5
-        )
+        # Try multiple search strategies for better matching
+        search_attempts = [
+            # Exact search
+            {'artist': artist, 'recording': title, 'release': album if album and album.lower() != 'unknown' else ""},
+            # Artist and title only (in case album is wrong)
+            {'artist': artist, 'recording': title},
+            # Fuzzy search - remove common words that might interfere
+            {'artist': re.sub(r'\b(the|and|&|feat\.?|ft\.?)\b', '', artist, flags=re.IGNORECASE).strip(), 
+             'recording': re.sub(r'\b(feat\.?|ft\.?|featuring)\b.*$', '', title, flags=re.IGNORECASE).strip()},
+        ]
         
-        if result['recording-list']:
-            return result['recording-list'][0]  # Return best match
+        for search_params in search_attempts:
+            # Skip if we've removed too much
+            if not search_params.get('artist') or not search_params.get('recording'):
+                continue
+                
+            try:
+                result = musicbrainzngs.search_recordings(
+                    limit=5,
+                    **search_params
+                )
+                
+                if result['recording-list']:
+                    # Score results based on similarity
+                    best_match = None
+                    best_score = 0
+                    
+                    for recording in result['recording-list']:
+                        score = 0
+                        rec_title = recording.get('title', '').lower()
+                        rec_artist = ''
+                        if recording.get('artist-credit'):
+                            rec_artist = recording['artist-credit'][0]['artist']['name'].lower()
+                        
+                        # Simple scoring system
+                        if rec_title == title.lower():
+                            score += 50
+                        elif title.lower() in rec_title or rec_title in title.lower():
+                            score += 30
+                            
+                        if rec_artist == artist.lower():
+                            score += 40
+                        elif artist.lower() in rec_artist or rec_artist in artist.lower():
+                            score += 25
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_match = recording
+                    
+                    # Return best match if score is reasonable
+                    if best_match and best_score >= 40:
+                        return best_match
+                        
+            except Exception as e:
+                continue  # Try next search strategy
+                
         return None
     except Exception as e:
         return None
@@ -451,7 +581,9 @@ def scan_folder_metadata(folder_path, msg_queue):
                 
                 metadata = get_audio_metadata(file_path)
                 if metadata:
-                    files_metadata.append(metadata)
+                    # Enhance metadata with filename information
+                    enhanced_metadata = enhance_metadata_with_filename(metadata)
+                    files_metadata.append(enhanced_metadata)
     
     msg_queue.put(f"Found {len(files_metadata)} audio files")
     return files_metadata
@@ -461,7 +593,10 @@ def check_musicbrainz_metadata(metadata_list, msg_queue):
     suggestions = []
     
     for i, metadata in enumerate(metadata_list):
-        msg_queue.put(f"Checking MusicBrainz for: {metadata['title']} - {metadata['artist']}")
+        # Show original filename for context
+        filename = os.path.basename(metadata['file_path'])
+        msg_queue.put(f"Checking ({i+1}/{len(metadata_list)}): {filename}")
+        msg_queue.put(f"  Current: {metadata['artist']} - {metadata['title']}")
         
         mb_result = search_musicbrainz(
             metadata['artist'], 
@@ -481,6 +616,8 @@ def check_musicbrainz_metadata(metadata_list, msg_queue):
             if mb_result.get('release-list'):
                 mb_album = mb_result['release-list'][0]['title']
             
+            msg_queue.put(f"  Found: {mb_artist} - {mb_title}")
+            
             # Check if updates are needed
             needs_update = (
                 current_title != mb_title and mb_title or
@@ -498,6 +635,45 @@ def check_musicbrainz_metadata(metadata_list, msg_queue):
                         'release_date': mb_result.get('release-list', [{}])[0].get('date', '') if mb_result.get('release-list') else ''
                     }
                 })
+                msg_queue.put(f"  → Suggested update available")
+            else:
+                msg_queue.put(f"  → Metadata already correct")
+        else:
+            # Try searching with filename data as fallback
+            filename_data = parse_filename_metadata(filename)
+            if filename_data['artist'] and filename_data['title']:
+                msg_queue.put(f"  Trying filename data: {filename_data['artist']} - {filename_data['title']}")
+                mb_result = search_musicbrainz(
+                    filename_data['artist'],
+                    filename_data['title'],
+                    ''
+                )
+                
+                if mb_result:
+                    mb_title = mb_result.get('title', '')
+                    mb_artist = mb_result['artist-credit'][0]['artist']['name'] if mb_result.get('artist-credit') else ''
+                    mb_album = ''
+                    if mb_result.get('release-list'):
+                        mb_album = mb_result['release-list'][0]['title']
+                    
+                    msg_queue.put(f"  Found via filename: {mb_artist} - {mb_title}")
+                    
+                    suggestions.append({
+                        'file': metadata,
+                        'musicbrainz': {
+                            'title': mb_title,
+                            'artist': mb_artist,
+                            'album': mb_album,
+                            'release_date': mb_result.get('release-list', [{}])[0].get('date', '') if mb_result.get('release-list') else ''
+                        }
+                    })
+                else:
+                    msg_queue.put(f"  → No matches found")
+            else:
+                msg_queue.put(f"  → No matches found")
+    
+    msg_queue.put(f"Found {len(suggestions)} suggested updates")
+    return suggestions
     
     msg_queue.put(f"Found {len(suggestions)} files with potential metadata updates")
     return suggestions
