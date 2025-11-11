@@ -447,7 +447,7 @@ def parse_filename_metadata(filename):
 
 def enhance_metadata_with_filename(file_metadata):
     """Enhance existing metadata using filename information.""" 
-    filename = os.path.basename(file_metadata['file_path'])
+    filename = os.path.basename(file_metadata['filepath'])  # Changed from 'file_path' to 'filepath'
     filename_data = parse_filename_metadata(filename)
     
     enhanced = file_metadata.copy()
@@ -594,7 +594,7 @@ def check_musicbrainz_metadata(metadata_list, msg_queue):
     
     for i, metadata in enumerate(metadata_list):
         # Show original filename for context
-        filename = os.path.basename(metadata['file_path'])
+        filename = os.path.basename(metadata['filepath'])  # Changed from 'file_path' to 'filepath'
         msg_queue.put(f"Checking ({i+1}/{len(metadata_list)}): {filename}")
         msg_queue.put(f"  Current: {metadata['artist']} - {metadata['title']}")
         
